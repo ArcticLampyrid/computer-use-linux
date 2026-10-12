@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.16] - 2026-10-13
+
+### Fixed
+- Replace the KWin backend atomic update with stable Rust primitives so source builds work on Rust 1.93.1. (#252)
+
 ## [0.7.15] - 2026-10-10
 
 ### Fixed
@@ -808,7 +813,8 @@ pages; also bumps the MCP server's advertised version string to match.
 - Validated against GNOME 50.1 on Wayland (Ubuntu 25.10).
 - KDE / Sway / Hyprland untested — see README support matrix.
 
-[Unreleased]: https://github.com/agent-sh/computer-use-linux/compare/v0.7.15...HEAD
+[Unreleased]: https://github.com/agent-sh/computer-use-linux/compare/v0.7.16...HEAD
+[0.7.16]: https://github.com/agent-sh/computer-use-linux/compare/v0.7.15...v0.7.16
 [0.7.15]: https://github.com/agent-sh/computer-use-linux/compare/v0.7.14...v0.7.15
 [0.7.14]: https://github.com/agent-sh/computer-use-linux/compare/v0.7.13...v0.7.14
 [0.7.13]: https://github.com/agent-sh/computer-use-linux/compare/v0.7.12...v0.7.13
