@@ -1,8 +1,9 @@
 use crate::atspi_tree::{
-    focused_element_summary_in_app, list_accessible_apps, object_ref_owner_pid,
-    perform_action as invoke_accessibility_action, perform_named_action, probe_focused_element,
-    set_element_value, snapshot_accessibility_tree, AccessibilityAction, AccessibilityNode,
-    AccessibleAppSummary, Bounds, FocusProbe, FocusedElementSummary, ValueSetInvocation,
+    accessibility_chrome_context, focused_element_summary_in_app, list_accessible_apps,
+    object_ref_owner_pid, perform_action as invoke_accessibility_action, perform_named_action,
+    probe_focused_element, set_element_value, snapshot_accessibility_tree, AccessibilityAction,
+    AccessibilityNode, AccessibleAppSummary, Bounds, FocusProbe, FocusedElementSummary,
+    ValueSetInvocation,
 };
 use crate::diagnostics::{doctor_report, setup_accessibility_report, DoctorReport, SetupReport};
 use crate::gnome_extension::{setup_window_targeting_report, WindowTargetingSetupReport};
@@ -51,6 +52,11 @@ use xkeysym::key as xkey;
 use zbus::{Connection as ZbusConnection, Proxy as ZbusProxy};
 
 const INPUT_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
+// Linux limits each exec argument (including its NUL) to 32 pages, at least
+// 128 KiB on supported platforms. Reject oversized text before sending input.
+const WTYPE_MAX_TEXT_BYTES: usize = 128 * 1024 - 1;
+const WTYPE_STDIN_MAX_CHARS: usize = 100;
+const WTYPE_FOCUS_TIMEOUT: Duration = Duration::from_millis(1500);
 const MAX_SCROLL_PAGES: f64 = 100.0;
 const YDOTOOL_TYPE_CHARS_PER_SECOND: u64 = 20;
 const KDE_CLIPBOARD_DBUS_TIMEOUT: Duration = Duration::from_secs(3);
@@ -425,6 +431,7 @@ impl ComputerUseLinux {
         let mut tree_scoped = false;
         let mut tree_root_pid = None;
         let mut accessibility_tree_truncated = false;
+        let mut shell_only_note = None;
         let (accessibility_tree, accessibility_tree_raw_count, accessibility_error) =
             if diagnostics.readiness.can_build_accessibility_tree {
                 let target_pid = window_context.as_ref().and_then(|window| window.pid);
@@ -441,7 +448,13 @@ impl ComputerUseLinux {
                         tree_root_pid = snapshot.root_pid;
                         accessibility_tree_truncated = snapshot.truncated;
                         let raw_count = snapshot.nodes.len();
-                        (compact_accessibility_tree(snapshot.nodes), raw_count, None)
+                        let (nodes, note) = compact_accessibility_tree_with_note(
+                            snapshot.nodes,
+                            tree_scoped,
+                            accessibility_tree_truncated,
+                        );
+                        shell_only_note = note;
+                        (nodes, raw_count, None)
                     }
                     Err(error) => (Vec::new(), 0, Some(format!("{error:#}"))),
                 }
@@ -505,6 +518,10 @@ impl ComputerUseLinux {
             message.push_str(warning);
         }
         if let Some(note) = truncated_accessibility_tree_note(accessibility_tree_truncated) {
+            message.push(' ');
+            message.push_str(note);
+        }
+        if let Some(note) = shell_only_note {
             message.push(' ');
             message.push_str(note);
         }
@@ -1748,7 +1765,7 @@ impl ComputerUseLinux {
 
     #[tool(
         name = "type_text",
-        description = "Type literal text using keyboard input, optionally after focusing a target window or terminal selector.",
+        description = "Type literal text using keyboard input, optionally after focusing a target window or terminal selector. Success confirms dispatch, not field-content verification; re-observe the target before retrying. The wtype backend rejects NUL and text over 131071 UTF-8 bytes before focus or indicators; Hyprland rejects confirmed password fields; ambiguous fields and terminals use private stdin for at most 100 Unicode characters per call.",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -1760,7 +1777,22 @@ impl ComputerUseLinux {
         &self,
         Parameters(params): Parameters<TypeTextParams>,
     ) -> Json<ActionOutput> {
+        let Json(mut output) = self.dispatch_type_text(params).await;
+        if output.ok {
+            output.message.push_str(
+                " Field contents were not verified; re-observe the target before retrying.",
+            );
+        }
+        Json(output)
+    }
+
+    async fn dispatch_type_text(&self, params: TypeTextParams) -> Json<ActionOutput> {
         let received = Some(serde_json::json!(params.clone()));
+        // Reject before focus changes or any indicator can display the text.
+        let wtype_mode = self.wtype_text_mode();
+        if let Err(message) = preflight_type_text(&params.text, wtype_mode) {
+            return Json(action_result("type_text", Err(message), received));
+        }
         let input_guard = Arc::clone(&self.input_operation_lock).lock_owned().await;
         let window_target = params.window_target();
         let focus = match self.focus_target_for_input(&window_target).await {
@@ -1775,7 +1807,34 @@ impl ComputerUseLinux {
                 });
             }
         };
-        let secret = self.typing_into_secret(focus.as_ref()).await;
+        let hyprland_argument_mode = wtype_mode == Some(WtypeTextMode::Argument);
+        let (wtype_mode, secret) = if hyprland_argument_mode {
+            match hyprland_wtype_delivery(&params.text, self.input_focus_probe(focus.as_ref()))
+                .await
+            {
+                Ok(mode) => (Some(mode), mode == WtypeTextMode::Stdin),
+                Err(message) => {
+                    return Json(action_result_with_focus(
+                        "type_text",
+                        Err(message),
+                        received,
+                        focus,
+                    ))
+                }
+            }
+        } else {
+            (wtype_mode, self.typing_into_secret(focus.as_ref()).await)
+        };
+        if let Some(mode) = wtype_mode {
+            if let Err(message) = validate_wtype_privacy(mode, secret) {
+                return Json(action_result_with_focus(
+                    "type_text",
+                    Err(message),
+                    received,
+                    focus,
+                ));
+            }
+        }
         self.indicator.text("type_text", &params.text, secret).await;
         if self.should_prefer_kde_clipboard_text_backend() {
             match self.ensure_portal_keyboard_session().await {
@@ -1909,10 +1968,10 @@ impl ComputerUseLinux {
             }
             return Json(output);
         }
-        if self.should_prefer_wtype_keyboard() {
+        if let Some(mode) = wtype_mode {
             let text = params.text.clone();
             let (input_guard, result) = run_cancellation_safe_input(input_guard, async move {
-                run_wtype_type_text_or_fallback(Path::new("wtype"), &text, || {
+                run_wtype_type_text_or_fallback(Path::new("wtype"), &text, mode, secret, || {
                     run_ydotool_type_text(&text)
                 })
                 .await
@@ -1931,6 +1990,9 @@ impl ComputerUseLinux {
             if used_wtype {
                 output.message =
                     "Action sent through wtype (Wayland virtual-keyboard protocol).".to_string();
+                if hyprland_argument_mode && mode == WtypeTextMode::Stdin {
+                    output.message.push_str(" AT-SPI could not classify the field; text was sent through stdin, limited to 100 Unicode characters per call.");
+                }
             }
             if output.ok && focus.is_some() {
                 let notes = self.input_landing_notes(focus.as_ref(), true).await;
@@ -2009,7 +2071,7 @@ impl ComputerUseLinux {
     // can't be env!("CARGO_PKG_VERSION"); the MCP safety check (CI) fails the
     // build if it drifts from the Cargo version.
     version = "0.7.16",
-    instructions = "Begin every turn that uses Computer Use by calling get_app_state. If diagnostics report disabled GNOME accessibility, call setup_accessibility before asking the user to retry. Use list_windows/focused_window before targeted keyboard input. If diagnostics report windowing.can_list_windows=false on GNOME, call setup_window_targeting to install the optional GNOME Shell extension backend, then ask the user to log out and back in if the setup report says a shell reload is required. This Linux backend can capture size-bounded screenshots through GNOME Shell or XDG Desktop Portal, read AT-SPI trees with action/value metadata, invoke native AT-SPI actions, set AT-SPI values or editable text, list/focus compositor windows through registered Linux window backends when the session permits it, attach best-effort terminal tty/process metadata to terminal windows, send coordinate or element-targeted click/scroll/drag input through the Wayland remote desktop portal when available, and send literal type_text through KDE clipboard integration on Plasma Wayland, wtype on compatible Wayland compositors, or portal keysyms on other Wayland sessions. Portal text startup or conversion failures return an error without replaying through ydotool. GNOME preflights the complete text against every configured keyboard layout group because the background reader cannot establish the active group; rejected text can use set_value on an editable field. Raw ydotool text is limited to printable ASCII, tab and newline, uses US physical key positions, and requires checking the resulting field contents under the active layout. Screenshot results include width/height for the returned image plus coordinate_width/coordinate_height and scale for desktop coordinate conversion; request more detail with max_width, max_height, max_bytes, format=jpeg, quality, or a smaller target/crop instead of relying on unbounded screenshots. Tools with readOnlyHint=false may mutate local desktop or application state; hosts should require approval for actions that can submit, delete, send, purchase, or overwrite data. For element-targeted actions, prefer element_index from the latest get_app_state result; click, perform_action, and set_value can also use semantic role/name/text/states selectors when the target is unique. type_text and press_key accept optional window_id, pid, app_id, wm_class, title, tty, terminal_pid, terminal_command, or terminal_cwd selectors and refuse targeted input if focus cannot be verified. After targeted keyboard input, results append focused-element feedback from AT-SPI (role, name, editable) and warn when a concrete non-terminal focus is not editable. Terminals accept keyboard input without an EditableText interface. Focus feedback does not verify the typed contents; re-observe the target before retrying. Screenshot, click, and input results warn when the target window or coordinate is partially or fully off-screen; use move_window/resize_window (GNOME Shell extension backend) to bring a window fully on-screen before retrying. scroll accepts the same window targeting and relative coordinates as click. get_app_state returns a compact readiness block by default; pass verbose=true for the full diagnostics dump. Scope get_app_state with app_name_or_bundle_identifier or a window target (window_id, pid, app_id, wm_class, title); without one it returns the whole desktop AT-SPI tree, reports tree_scoped=false, and warns in message, which can flood context. accessibility_tree_truncated=true means the node, depth, or read budget stopped traversal with unread elements left; recover by scoping to a narrower app or window target and raising max_nodes or max_depth (hard caps 2000 and 64), not by lowering max_nodes. Electron apps expose no AT-SPI tree unless launched with --force-renderer-accessibility."
+    instructions = "Begin every turn that uses Computer Use by calling get_app_state. If diagnostics report disabled GNOME accessibility, call setup_accessibility before asking the user to retry. Use list_windows/focused_window before targeted keyboard input. If diagnostics report windowing.can_list_windows=false on GNOME, call setup_window_targeting to install the optional GNOME Shell extension backend, then ask the user to log out and back in if the setup report says a shell reload is required. This Linux backend can capture size-bounded screenshots through GNOME Shell or XDG Desktop Portal, read AT-SPI trees with action/value metadata, invoke native AT-SPI actions, set AT-SPI values or editable text, list/focus compositor windows through registered Linux window backends when the session permits it, attach best-effort terminal tty/process metadata to terminal windows, send coordinate or element-targeted click/scroll/drag input through the Wayland remote desktop portal when available, and send literal type_text through KDE clipboard integration on Plasma Wayland, wtype on compatible Wayland compositors, or portal keysyms on other Wayland sessions. Portal text startup or conversion failures return an error without replaying through ydotool. GNOME preflights the complete text against every configured keyboard layout group because the background reader cannot establish the active group; rejected text can use set_value on an editable field. Raw ydotool text is limited to printable ASCII, tab and newline, uses US physical key positions, and requires checking the resulting field contents under the active layout. Screenshot results include width/height for the returned image plus coordinate_width/coordinate_height and scale for desktop coordinate conversion; request more detail with max_width, max_height, max_bytes, format=jpeg, quality, or a smaller target/crop instead of relying on unbounded screenshots. Tools with readOnlyHint=false may mutate local desktop or application state; hosts should require approval for actions that can submit, delete, send, purchase, or overwrite data. For element-targeted actions, prefer element_index from the latest get_app_state result; click, perform_action, and set_value can also use semantic role/name/text/states selectors when the target is unique. type_text and press_key accept optional window_id, pid, app_id, wm_class, title, tty, terminal_pid, terminal_command, or terminal_cwd selectors and refuse targeted input if focus cannot be verified. After targeted keyboard input, results append focused-element feedback from AT-SPI (role, name, editable) and warn when a concrete non-terminal focus is not editable. Exact window focus alone does not suppress a missing-focus warning; only a complete scoped tree containing window/menu chrome without content makes it informational. Terminals accept keyboard input without an EditableText interface. On Hyprland, wtype uses a single literal argument after -- to avoid stdin keymap-refresh corruption; text is visible in process arguments, so confirmed password fields are rejected (use set_value). Terminals and ambiguous fields, with or without AT-SPI, use private stdin for at most 100 Unicode characters per call; split larger input into smaller calls or expose accessibility. Input classification has its own 1500 ms budget, independent of the 250 ms cosmetic indicator timeout. Other compatible compositors retain stdin. The wtype path rejects NUL and more than 131071 UTF-8 bytes before focus or indicators. A successful type_text result confirms dispatch only; every text backend leaves field contents unverified. Re-observe the target before retrying. Screenshot, click, and input results warn when the target window or coordinate is partially or fully off-screen; use move_window/resize_window (GNOME Shell extension backend) to bring a window fully on-screen before retrying. scroll accepts the same window targeting and relative coordinates as click. get_app_state returns a compact readiness block by default; pass verbose=true for the full diagnostics dump. Scope get_app_state with app_name_or_bundle_identifier or a window target (window_id, pid, app_id, wm_class, title); without one it returns the whole desktop AT-SPI tree, reports tree_scoped=false, and warns in message, which can flood context. accessibility_tree_truncated=true means the node, depth, or read budget stopped traversal with unread elements left; recover by scoping to a narrower app or window target and raising max_nodes or max_depth (hard caps 2000 and 64), not by lowering max_nodes. Electron apps with only window/menu chrome may need --force-renderer-accessibility to expose renderer content."
 )]
 impl ServerHandler for ComputerUseLinux {}
 
@@ -3125,6 +3187,19 @@ impl ComputerUseLinux {
         )
     }
 
+    fn wtype_text_mode(&self) -> Option<WtypeTextMode> {
+        if self.should_prefer_xdotool_keyboard()
+            || self.should_prefer_kde_clipboard_text_backend()
+            || self.should_prefer_portal_text_backend()
+            || !self.should_prefer_wtype_keyboard()
+        {
+            return None;
+        }
+        Some(wtype_text_mode_for_desktop(
+            env::var("XDG_CURRENT_DESKTOP").ok().as_deref(),
+        ))
+    }
+
     fn should_prefer_xdotool_pointer(&self) -> bool {
         crate::diagnostics::hydrate_session_bus_env();
         prefer_xdotool_pointer(
@@ -3505,33 +3580,30 @@ impl ComputerUseLinux {
         *self.desktop_size.lock().ok()?
     }
 
-    /// Whether typed text would land in a password field. Unknown counts as
-    /// yes, so the overlay never shows a secret it could not rule out.
+    /// Cosmetic secrecy probe: timeout only masks the indicator, never gates input.
     async fn typing_into_secret(&self, focus: Option<&WindowFocusResult>) -> bool {
         if !self.indicator.enabled() {
             return true;
         }
-        let focused_role = async {
-            let pid = match focus {
-                Some(focus) => focus
-                    .focused_window
-                    .as_ref()
-                    .and_then(|window| window.pid)
-                    .or(focus.requested_window.pid),
-                None => focused_window().await.ok().flatten()?.pid,
-            };
-            // Only the app that receives the keystrokes can tell where they
-            // land; another app may keep a stale focused element.
-            match probe_focused_element(Some(pid?)).await.ok()? {
-                FocusProbe::Found(element) => Some(element.role),
-                _ => None,
-            }
-        };
-        timeout(Duration::from_millis(250), focused_role)
+        timeout(Duration::from_millis(250), self.input_focus_probe(focus))
             .await
             .ok()
             .flatten()
-            .is_none_or(|role| crate::indicator::is_secret_role(&role))
+            .as_ref()
+            .is_none_or(focus_requires_secret_protection)
+    }
+
+    /// Probe only the receiving app; the caller chooses its own time budget.
+    async fn input_focus_probe(&self, focus: Option<&WindowFocusResult>) -> Option<FocusProbe> {
+        let pid = match focus {
+            Some(focus) => focus
+                .focused_window
+                .as_ref()
+                .and_then(|window| window.pid)
+                .or(focus.requested_window.pid),
+            None => focused_window().await.ok().flatten()?.pid,
+        }?;
+        probe_focused_element(Some(pid)).await.ok()
     }
 
     /// COORDINATE SPACES: window bounds (list_windows / extension frame rects)
@@ -3643,7 +3715,11 @@ impl ComputerUseLinux {
             .and_then(|window| window.pid)
             .or(focus.requested_window.pid);
         match timeout(Duration::from_millis(1500), probe_focused_element(pid)).await {
-            Ok(Ok(probe)) => Some(focus_probe_feedback(&probe, expects_editable)),
+            Ok(Ok(probe)) => Some(focus_probe_feedback(
+                &probe,
+                expects_editable,
+                focus.exact_window_focused,
+            )),
             Ok(Err(error)) => Some(format!(
                 "Focused-element feedback unavailable ({}).",
                 first_line(&format!("{error:#}"))
@@ -4301,6 +4377,42 @@ fn truncated_accessibility_tree_note(truncated: bool) -> Option<&'static str> {
     truncated.then_some(
         "The node, depth, or read budget stopped traversal with unread elements left. To recover missing elements, scope to a narrower app or window target and raise max_nodes or max_depth (hard caps 2000 and 64); lowering max_nodes would drop more.",
     )
+}
+
+fn shell_only_accessibility_tree_note(
+    nodes: &[AccessibilityNode],
+    scoped: bool,
+    truncated: bool,
+) -> Option<&'static str> {
+    if !scoped || truncated || nodes.is_empty() {
+        return None;
+    }
+    let mut menu_nodes = std::collections::HashSet::new();
+    nodes.iter().all(|node| {
+        let in_menu = node.parent_index.is_some_and(|parent| menu_nodes.contains(&parent));
+        let Some(menu) = accessibility_chrome_context(&node.role, in_menu) else {
+            return false;
+        };
+        if menu {
+            menu_nodes.insert(node.index);
+        }
+        let has_content_text = !menu && node.text.as_ref().and_then(|text| text.content.as_deref())
+            .is_some_and(|text| text.chars().any(|ch| ch != '\u{fffc}' && !ch.is_whitespace()));
+        !node.supports_editable_text && node.value.is_none() && !has_content_text
+    })
+        .then_some(
+            "AT-SPI exposes only window/menu chrome; no content controls were observed. If this is an Electron/Chromium app, relaunch it with --force-renderer-accessibility to expose renderer content. Screenshots can still be used for observation; this tree does not establish that the UI is empty.",
+        )
+}
+
+fn compact_accessibility_tree_with_note(
+    nodes: Vec<AccessibilityNode>,
+    scoped: bool,
+    truncated: bool,
+) -> (Vec<AccessibilityNode>, Option<&'static str>) {
+    // Menu ancestry is observation metadata; compaction can remove its nodes.
+    let note = shell_only_accessibility_tree_note(&nodes, scoped, truncated);
+    (compact_accessibility_tree(nodes), note)
 }
 
 fn compact_accessibility_tree(nodes: Vec<AccessibilityNode>) -> Vec<AccessibilityNode> {
@@ -4966,12 +5078,17 @@ fn with_focus_context(mut output: ActionOutput, focus: Option<WindowFocusResult>
     output
 }
 
-/// Post-input focus feedback. Only a complete search that finds nothing is a
-/// warning; a search that hit a limit, or an app without an AT-SPI tree, cannot
-/// tell whether the input landed, so it says that instead.
-fn focus_probe_feedback(probe: &FocusProbe, expects_editable: bool) -> String {
+/// Exact window focus alone cannot rule out lost input. Only a complete,
+/// scoped shell-only tree explains the missing focus as unavailable content.
+fn focus_probe_feedback(
+    probe: &FocusProbe,
+    expects_editable: bool,
+    exact_window_focused: bool,
+) -> String {
     match probe {
         FocusProbe::Found(element) => describe_focused_element(element, expects_editable),
+        FocusProbe::ShellOnly if exact_window_focused => "Focused-element feedback unavailable: window focus was verified before input, but AT-SPI exposes only window/menu chrome in the target app. Field contents were not verified. Electron/Chromium apps may need --force-renderer-accessibility.".to_string(),
+        FocusProbe::ShellOnly => "WARNING: AT-SPI exposes only window/menu chrome and no focused element in the target app; the input may have landed nowhere.".to_string(),
         FocusProbe::NoneFocused => "WARNING: AT-SPI reports no focused element in the target app; the input may have landed nowhere.".to_string(),
         FocusProbe::Incomplete => "Focused-element feedback unavailable: the focused element was not reached within the AT-SPI search limits, so the input could not be verified. Its absence here does not mean the input was lost.".to_string(),
         FocusProbe::NoAccessibleApp => "Focused-element feedback unavailable: the target app exposes no AT-SPI tree, so the input could not be verified. Electron apps need --force-renderer-accessibility.".to_string(),
@@ -5000,7 +5117,7 @@ fn describe_focused_element(element: &FocusedElementSummary, expects_editable: b
         .filter(|name| !name.is_empty())
         .map(|name| format!(" \"{name}\""))
         .unwrap_or_default();
-    if element.editable {
+    if focused_element_is_editable(element) {
         format!("Focused element: {}{name} (editable).", element.role)
     } else if element.is_terminal {
         format!(
@@ -5714,12 +5831,18 @@ where
 async fn run_wtype_type_text_or_fallback<F, Fut>(
     program: &Path,
     text: &str,
+    mode: WtypeTextMode,
+    secret: bool,
     fallback: F,
 ) -> std::result::Result<KeyboardCommandResult, String>
 where
     F: FnOnce() -> Fut,
     Fut: Future<Output = std::result::Result<Output, String>>,
 {
+    // Defense in depth: no helper caller may put a secret in argv or bypass
+    // validation through the missing-program fallback.
+    validate_wtype_text(text)?;
+    validate_wtype_privacy(mode, secret)?;
     let available = if program.components().count() > 1 {
         std::fs::metadata(program)
             .map(|meta| meta.is_file())
@@ -5735,14 +5858,32 @@ where
     }
 
     let mut command = TokioCommand::new(program);
-    command.arg("-");
-    let output = crate::command_runner::output_with_stdin(
-        command,
-        "run wtype",
-        ydotool_type_timeout(text),
-        text.as_bytes().to_vec(),
-    )
-    .await
+    // wtype's stdin mode uploads a new keymap every 100 characters. On
+    // Hyprland/Electron those changes can turn literal text into modifier
+    // keys and shortcuts while wtype still exits successfully. Passing one
+    // literal argument builds the complete keymap before the first key event.
+    // `--` prevents option-looking text from becoming wtype commands.
+    let output = match mode {
+        WtypeTextMode::Argument => {
+            command.args(["--", text]);
+            crate::command_runner::output_with_timeout(
+                command,
+                "run wtype",
+                ydotool_type_timeout(text),
+            )
+            .await
+        }
+        WtypeTextMode::Stdin => {
+            command.arg("-");
+            crate::command_runner::output_with_stdin(
+                command,
+                "run wtype",
+                ydotool_type_timeout(text),
+                text.as_bytes().to_vec(),
+            )
+            .await
+        }
+    }
     .map_err(|error| format!("{error:#}"))?;
     if !output.status.success() {
         return Err(command_output_error("wtype", output));
@@ -5751,6 +5892,113 @@ where
         output,
         backend: KeyboardCommandBackend::Wtype,
     })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WtypeTextMode {
+    Argument,
+    Stdin,
+}
+
+enum WtypeFieldKind {
+    Password,
+    NonSecretText,
+    Ambiguous,
+}
+
+fn classify_wtype_field(element: &FocusedElementSummary) -> WtypeFieldKind {
+    // The overlay's mask predicate includes uncertainty. Only an explicit
+    // password role confirms a password; terminals can be password prompts.
+    if element.role.to_ascii_lowercase().contains("password") {
+        WtypeFieldKind::Password
+    } else if !element.is_terminal
+        && !crate::indicator::is_secret_role(&element.role)
+        && focused_element_is_editable(element)
+    {
+        WtypeFieldKind::NonSecretText
+    } else {
+        WtypeFieldKind::Ambiguous
+    }
+}
+
+fn wtype_text_mode_for_desktop(desktop: Option<&str>) -> WtypeTextMode {
+    if desktop.is_some_and(|value| {
+        value
+            .split(':')
+            .any(|part| part.eq_ignore_ascii_case("hyprland"))
+    }) {
+        WtypeTextMode::Argument
+    } else {
+        WtypeTextMode::Stdin
+    }
+}
+
+fn preflight_type_text(text: &str, mode: Option<WtypeTextMode>) -> std::result::Result<(), String> {
+    if mode.is_some() {
+        validate_wtype_text(text)?;
+    } else if text.contains('\0') {
+        return Err("Literal text was not sent: NUL characters are unsupported.".to_string());
+    }
+    Ok(())
+}
+
+async fn hyprland_wtype_delivery(
+    text: &str,
+    probe: impl Future<Output = Option<FocusProbe>>,
+) -> std::result::Result<WtypeTextMode, String> {
+    let probe = timeout(WTYPE_FOCUS_TIMEOUT, probe).await.ok().flatten();
+    if let Some(FocusProbe::Found(element)) = probe.as_ref() {
+        match classify_wtype_field(element) {
+            WtypeFieldKind::Password => return Err("Literal text was not sent: wtype argument mode is disabled for password fields. Use set_value on an editable field.".to_string()),
+            WtypeFieldKind::NonSecretText => return Ok(WtypeTextMode::Argument),
+            WtypeFieldKind::Ambiguous => {}
+        }
+    }
+    // Terminals and generic text roles remain ambiguous even with AT-SPI.
+    // Keep their stdin route, bounded to a single wtype batch so no mid-text
+    // keymap refresh is needed. Ambiguous text must never be exposed in argv.
+    if text.chars().count() <= WTYPE_STDIN_MAX_CHARS {
+        Ok(WtypeTextMode::Stdin)
+    } else {
+        Err(format!("Literal text was not sent: the focused field could not be classified. Hyprland's private stdin fallback accepts at most {WTYPE_STDIN_MAX_CHARS} Unicode characters per call to avoid keymap-refresh corruption. Send smaller calls and verify each one, or enable the target's accessibility support."))
+    }
+}
+
+fn validate_wtype_privacy(mode: WtypeTextMode, secret: bool) -> std::result::Result<(), String> {
+    if mode == WtypeTextMode::Argument && secret {
+        return Err("Literal text was not sent: wtype argument mode is disabled for password fields and fields whose secrecy could not be determined. Enable the target application's accessibility support or use set_value on an editable field.".to_string());
+    }
+    Ok(())
+}
+
+fn focus_requires_secret_protection(probe: &FocusProbe) -> bool {
+    match probe {
+        FocusProbe::Found(element) => {
+            // Electron exposes the Editable state on normal entries without
+            // implementing EditableText. The interface is not a secrecy test.
+            let accepts_text = focused_element_is_editable(element) || element.is_terminal;
+            crate::indicator::is_secret_role(&element.role) || !accepts_text
+        }
+        _ => true,
+    }
+}
+
+fn focused_element_is_editable(element: &FocusedElementSummary) -> bool {
+    element.editable || element.states.iter().any(|state| state == "editable")
+}
+
+fn validate_wtype_text(text: &str) -> std::result::Result<(), String> {
+    if text.contains('\0') {
+        return Err(
+            "Literal text was not sent: wtype cannot represent NUL characters.".to_string(),
+        );
+    }
+    if text.len() > WTYPE_MAX_TEXT_BYTES {
+        return Err(format!(
+            "Literal text was not sent: wtype accepts at most {WTYPE_MAX_TEXT_BYTES} UTF-8 bytes per call. Use set_value on an editable field or send smaller text segments."
+        ));
+    }
+    Ok(())
 }
 
 /// True when `xdotool` can drive this session: an X11 session with `DISPLAY`
@@ -6530,6 +6778,119 @@ printf '%s %s\n' "${0##*/}" "$*" >> "$CUL_POINTER_TEST_LOG"
 
     fn node(index: u32, bounds: Option<Bounds>) -> AccessibilityNode {
         node_with_actions(index, bounds, Vec::new())
+    }
+
+    #[test]
+    fn shell_only_tree_explains_missing_renderer_content() {
+        let mut frame = node(0, None);
+        frame.role = "frame".to_string();
+        let nodes = [frame];
+        let note = shell_only_accessibility_tree_note(&nodes, true, false).unwrap();
+        assert!(note.contains("--force-renderer-accessibility"));
+        assert!(note.contains("If this is an Electron/Chromium app"));
+        assert!(shell_only_accessibility_tree_note(&nodes, false, false).is_none());
+        assert!(shell_only_accessibility_tree_note(&nodes, true, true).is_none());
+        assert!(shell_only_accessibility_tree_note(&[], true, false).is_none());
+    }
+
+    #[test]
+    fn content_and_editable_trees_do_not_get_renderer_hint() {
+        let mut content = node(0, None);
+        assert!(shell_only_accessibility_tree_note(&[content.clone()], true, false).is_none());
+        content.role = "frame".to_string();
+        content.supports_editable_text = true;
+        assert!(shell_only_accessibility_tree_note(&[content], true, false).is_none());
+    }
+
+    #[test]
+    fn native_menu_chrome_does_not_hide_the_renderer_hint() {
+        let mut frame = node(0, None);
+        frame.role = "frame".to_string();
+        let mut menu = node(1, None);
+        menu.role = "menu item".to_string();
+        menu.actions.push(AccessibilityAction {
+            index: 0,
+            name: "click".to_string(),
+            description: String::new(),
+            keybinding: String::new(),
+        });
+        assert!(
+            shell_only_accessibility_tree_note(&[frame.clone(), menu.clone()], true, false)
+                .is_some()
+        );
+        menu.supports_editable_text = true;
+        assert!(shell_only_accessibility_tree_note(&[frame, menu], true, false).is_none());
+    }
+
+    #[test]
+    fn native_menu_buttons_are_chrome_only_beneath_a_menu() {
+        let mut frame = node(0, None);
+        frame.role = "frame".to_string();
+        let mut panel = node(1, None);
+        panel.role = "panel".to_string();
+        panel.parent_index = Some(0);
+        let mut menu = node(2, None);
+        menu.role = "menu bar".to_string();
+        menu.parent_index = Some(1);
+        let mut button = node(3, None);
+        button.role = "button".to_string();
+        button.parent_index = Some(2);
+        assert!(shell_only_accessibility_tree_note(
+            &[frame.clone(), panel.clone(), menu.clone(), button.clone()],
+            true,
+            false
+        )
+        .is_some());
+        button.parent_index = Some(1);
+        assert!(
+            shell_only_accessibility_tree_note(&[frame, panel, menu, button], true, false)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn review_hint_keeps_raw_menu_ancestry_after_compaction() {
+        let mut frame = node(0, None);
+        frame.role = "frame".to_string();
+        frame.depth = 1;
+        let mut panel = node(1, None);
+        panel.role = "panel".to_string();
+        panel.name = None;
+        panel.depth = 2;
+        panel.parent_index = Some(0);
+        let mut menu = node(2, None);
+        menu.role = "menu bar".to_string();
+        menu.name = None;
+        menu.depth = 3;
+        menu.parent_index = Some(1);
+        let mut button = node(3, None);
+        button.role = "button".to_string();
+        button.depth = 4;
+        button.parent_index = Some(2);
+        let nodes = vec![frame, panel, menu, button];
+        let (compacted, note) = compact_accessibility_tree_with_note(nodes.clone(), true, false);
+        assert_eq!(
+            compacted.len(),
+            2,
+            "unnamed panel and menu bar should be compacted away"
+        );
+        assert_eq!(compacted[1].parent_index, Some(0));
+        assert!(
+            shell_only_accessibility_tree_note(&compacted, true, false).is_none(),
+            "compacted data cannot recover the removed menu context"
+        );
+        assert!(
+            note.is_some(),
+            "raw menu ancestry must determine the observation hint"
+        );
+        assert!(
+            compact_accessibility_tree_with_note(nodes.clone(), false, false)
+                .1
+                .is_none()
+        );
+        assert!(compact_accessibility_tree_with_note(nodes, true, true)
+            .1
+            .is_none());
     }
 
     fn node_with_actions(
@@ -8376,7 +8737,7 @@ printf '%s %s\n' "${0##*/}" "$*" >> "$CUL_POINTER_TEST_LOG"
     }
 
     #[tokio::test]
-    async fn wtype_receives_unicode_text_through_stdin() {
+    async fn wtype_passes_long_unicode_as_one_literal_argument() {
         let dir = std::env::temp_dir().join(format!(
             "computer-use-linux-wtype-unicode-{}-{:?}",
             std::process::id(),
@@ -8387,22 +8748,364 @@ printf '%s %s\n' "${0##*/}" "$*" >> "$CUL_POINTER_TEST_LOG"
         let captured = dir.join("captured");
         std::fs::write(
             &wtype,
-            format!("#!/bin/sh\ncat > '{}'\n", captured.display()),
+            format!(
+                "#!/bin/sh\n[ \"$#\" -eq 2 ] && [ \"$1\" = -- ] || exit 42\nprintf '%s' \"$2\" > '{}'\n",
+                captured.display()
+            ),
         )
         .expect("write fake wtype");
         std::fs::set_permissions(&wtype, std::fs::Permissions::from_mode(0o700))
             .expect("make fake wtype executable");
-        let text = "Zwölf Yaks aßen Öl über München";
+        let text =
+            "--Türkçe PostgreSQL (W, g, m, v, f, ş, ü) / 0123456789 - ; 'İstanbul'\n".repeat(50);
 
-        let result = run_wtype_type_text_or_fallback(&wtype, text, || async {
-            panic!("available wtype must not fall back")
-        })
+        let result = run_wtype_type_text_or_fallback(
+            &wtype,
+            &text,
+            WtypeTextMode::Argument,
+            false,
+            || async { panic!("available wtype must not fall back") },
+        )
         .await
         .expect("wtype should succeed");
 
         assert_eq!(result.backend, KeyboardCommandBackend::Wtype);
         assert_eq!(std::fs::read_to_string(&captured).unwrap(), text);
+        for text in ["--", "-", ""] {
+            run_wtype_type_text_or_fallback(
+                &wtype,
+                text,
+                WtypeTextMode::Argument,
+                false,
+                || async { panic!("available wtype must not fall back") },
+            )
+            .await
+            .unwrap();
+            assert_eq!(std::fs::read_to_string(&captured).unwrap(), text);
+        }
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn review_argument_mode_never_starts_wtype_for_protected_text() {
+        // Even /bin/false and the fallback must never run. An exit-status
+        // error would prove that validation happened too late.
+        let error = run_wtype_type_text_or_fallback(
+            Path::new("/bin/false"),
+            "synthetic-password",
+            WtypeTextMode::Argument,
+            true,
+            || async { panic!("secret input must not fall back") },
+        )
+        .await
+        .err()
+        .expect("secret text must be rejected");
+        assert!(error.contains("password fields"), "{error}");
+        let error = run_wtype_type_text_or_fallback(
+            Path::new("/definitely/missing/wtype"),
+            "synthetic-password",
+            WtypeTextMode::Argument,
+            true,
+            || async { panic!("secret input must not fall back even if wtype disappears") },
+        )
+        .await
+        .err()
+        .expect("secret text must be rejected");
+        assert!(error.contains("password fields"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn review_slow_focus_probe_has_its_own_input_budget() {
+        let mode = hyprland_wtype_delivery("long text".repeat(100).as_str(), async {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            Some(FocusProbe::Found(FocusedElementSummary {
+                role: "entry".to_string(),
+                name: None,
+                editable: false,
+                states: vec!["focused".to_string(), "editable".to_string()],
+                is_terminal: false,
+            }))
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            mode,
+            WtypeTextMode::Argument,
+            "the indicator's 250 ms budget must not gate text dispatch"
+        );
+    }
+
+    #[tokio::test]
+    async fn review_inaccessible_fields_keep_short_text_on_private_stdin() {
+        let text = "ş".repeat(WTYPE_STDIN_MAX_CHARS);
+        for probe in [
+            None,
+            Some(FocusProbe::NoAccessibleApp),
+            Some(FocusProbe::Incomplete),
+            Some(FocusProbe::NoneFocused),
+            Some(FocusProbe::ShellOnly),
+        ] {
+            let mode = hyprland_wtype_delivery(&text, async { probe })
+                .await
+                .unwrap();
+            assert_eq!(mode, WtypeTextMode::Stdin);
+            // cat accepts only '-' here; an argv text argument would instead
+            // be opened as a filename and fail. No desktop input is generated.
+            let result = run_wtype_type_text_or_fallback(
+                Path::new("/bin/cat"),
+                &text,
+                mode,
+                true,
+                || async { panic!("available stdin helper must not fall back") },
+            )
+            .await
+            .unwrap();
+            assert_eq!(result.output.stdout, text.as_bytes());
+        }
+    }
+
+    #[tokio::test]
+    async fn review_ambiguous_focused_roles_use_stdin_instead_of_password_rejection() {
+        let short = "ş".repeat(WTYPE_STDIN_MAX_CHARS);
+        let long = "ş".repeat(WTYPE_STDIN_MAX_CHARS + 1);
+        for (role, terminal) in [
+            ("terminal", true),
+            ("Terminal", true),
+            ("entry", true),
+            ("Entry", false),
+            ("Text", false),
+            ("text box", false),
+            ("TextBox", false),
+            ("textbox", false),
+            ("Unknown", false),
+            ("invalid", false),
+            ("", false),
+        ] {
+            // Editable state/interface must not make an ambiguous role public.
+            for editable in [false, true] {
+                let element = FocusedElementSummary {
+                    role: role.to_string(),
+                    name: None,
+                    editable,
+                    states: vec!["focused".to_string(), "editable".to_string()],
+                    is_terminal: terminal,
+                };
+                let mode = hyprland_wtype_delivery(&short, async {
+                    Some(FocusProbe::Found(element.clone()))
+                })
+                .await;
+                assert!(
+                    matches!(mode, Ok(WtypeTextMode::Stdin)),
+                    "{role:?}, editable={editable}: {mode:?}"
+                );
+                let delivered = run_wtype_type_text_or_fallback(
+                    Path::new("/bin/cat"),
+                    &short,
+                    mode.unwrap(),
+                    true,
+                    || async { panic!("stdin helper must not fall back") },
+                )
+                .await
+                .unwrap();
+                assert_eq!(delivered.output.stdout, short.as_bytes());
+                let error =
+                    hyprland_wtype_delivery(&long, async { Some(FocusProbe::Found(element)) })
+                        .await
+                        .unwrap_err();
+                assert!(
+                    error.contains("100 Unicode characters"),
+                    "{role:?}: {error}"
+                );
+                assert!(!error.contains("password fields"), "{role:?}: {error}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn only_confirmed_password_roles_are_hard_rejected() {
+        for role in [
+            "password text",
+            "PasswordText",
+            "PASSWORD TEXT",
+            "password entry",
+        ] {
+            let error = hyprland_wtype_delivery("short", async {
+                Some(FocusProbe::Found(FocusedElementSummary {
+                    role: role.to_string(),
+                    name: None,
+                    editable: true,
+                    states: vec!["focused".to_string(), "editable".to_string()],
+                    is_terminal: false,
+                }))
+            })
+            .await
+            .unwrap_err();
+            assert!(error.contains("password fields"), "{role}: {error}");
+        }
+        for role in ["entry", "text"] {
+            let mode = hyprland_wtype_delivery(&"x".repeat(3000), async {
+                Some(FocusProbe::Found(FocusedElementSummary {
+                    role: role.to_string(),
+                    name: None,
+                    editable: false,
+                    states: vec!["focused".to_string(), "editable".to_string()],
+                    is_terminal: false,
+                }))
+            })
+            .await
+            .unwrap();
+            assert_eq!(mode, WtypeTextMode::Argument, "{role}");
+        }
+    }
+
+    #[tokio::test]
+    async fn unknown_stdin_limit_and_password_rejection_remain_explicit() {
+        let error = hyprland_wtype_delivery(&"ş".repeat(WTYPE_STDIN_MAX_CHARS + 1), async {
+            Some(FocusProbe::NoAccessibleApp)
+        })
+        .await
+        .unwrap_err();
+        assert!(error.contains("100 Unicode characters"), "{error}");
+        let error = hyprland_wtype_delivery("short", async {
+            Some(FocusProbe::Found(FocusedElementSummary {
+                role: "password text".to_string(),
+                name: None,
+                editable: true,
+                states: vec!["focused".to_string(), "editable".to_string()],
+                is_terminal: false,
+            }))
+        })
+        .await
+        .unwrap_err();
+        assert!(error.contains("password fields"), "{error}");
+        let mode = hyprland_wtype_delivery("short", std::future::pending())
+            .await
+            .unwrap();
+        assert_eq!(
+            mode,
+            WtypeTextMode::Stdin,
+            "timeout must not reject all input"
+        );
+    }
+
+    #[test]
+    fn electron_editable_state_does_not_require_the_editable_text_interface() {
+        let mut element = FocusedElementSummary {
+            role: "entry".to_string(),
+            name: None,
+            editable: false,
+            states: vec!["focused".to_string(), "editable".to_string()],
+            is_terminal: false,
+        };
+        assert!(!focus_requires_secret_protection(&FocusProbe::Found(
+            element.clone()
+        )));
+        assert!(!describe_focused_element(&element, true).starts_with("WARNING:"));
+        element.role = "password text".to_string();
+        assert!(focus_requires_secret_protection(&FocusProbe::Found(
+            element.clone()
+        )));
+        element.role = "frame".to_string();
+        element.states.clear();
+        assert!(focus_requires_secret_protection(&FocusProbe::Found(
+            element
+        )));
+        for probe in [
+            FocusProbe::ShellOnly,
+            FocusProbe::NoneFocused,
+            FocusProbe::Incomplete,
+            FocusProbe::NoAccessibleApp,
+        ] {
+            assert!(focus_requires_secret_protection(&probe));
+        }
+    }
+
+    #[tokio::test]
+    async fn other_compositors_keep_wtype_text_on_stdin() {
+        for desktop in [None, Some("sway"), Some("wlroots"), Some("river")] {
+            let mode = wtype_text_mode_for_desktop(desktop);
+            assert_eq!(mode, WtypeTextMode::Stdin);
+            let text = "synthetic secret: şü / -- -";
+            let result = run_wtype_type_text_or_fallback(
+                Path::new("/bin/cat"),
+                text,
+                mode,
+                true,
+                || async { panic!("available stdin helper must not fall back") },
+            )
+            .await
+            .unwrap();
+            assert_eq!(result.output.stdout, text.as_bytes());
+        }
+        assert_eq!(
+            wtype_text_mode_for_desktop(Some("Hyprland")),
+            WtypeTextMode::Argument
+        );
+    }
+
+    #[test]
+    fn review_invalid_text_is_rejected_before_window_targeting() {
+        let dir = std::env::temp_dir().join(format!("cul-text-preflight-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let helper = dir.join("wtype");
+        std::fs::write(&helper, "#!/bin/sh\nexit 99\n").unwrap();
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "server::tests::invalid_text_preflight_child",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("CUL_PREFLIGHT_CHILD", "1")
+            .env("PATH", &dir)
+            .env("XDG_SESSION_TYPE", "wayland")
+            .env("XDG_CURRENT_DESKTOP", "Hyprland")
+            .env_remove("DISPLAY");
+        for key in [
+            "COMPUTER_USE_LINUX_FORCE_YDOTOOL_KEYBOARD",
+            "COMPUTER_USE_LINUX_FORCE_XDOTOOL_KEYBOARD",
+            "COMPUTER_USE_LINUX_FORCE_PORTAL_KEYBOARD",
+        ] {
+            command.env_remove(key);
+        }
+        let result = crate::command_runner::output_blocking_with_timeout(
+            &mut command,
+            "text preflight child",
+            Duration::from_secs(10),
+        )
+        .unwrap();
+        let _ = std::fs::remove_dir_all(dir);
+        assert!(
+            result.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "isolated environment subprocess; invoked by review_invalid_text_is_rejected_before_window_targeting"]
+    async fn invalid_text_preflight_child() {
+        assert_eq!(env::var("CUL_PREFLIGHT_CHILD").as_deref(), Ok("1"));
+        let server = ComputerUseLinux::default();
+        assert_eq!(server.wtype_text_mode(), Some(WtypeTextMode::Argument));
+        for text in [
+            "prefix\0suffix".to_string(),
+            "ş".repeat(WTYPE_MAX_TEXT_BYTES / 2 + 1),
+        ] {
+            let params: TypeTextParams =
+                serde_json::from_value(serde_json::json!({"text": text, "window_id": u64::MAX}))
+                    .unwrap();
+            let Json(result) = server.type_text(Parameters(params)).await;
+            assert!(!result.ok);
+            assert!(
+                result.message.contains("Literal text was not sent: wtype"),
+                "{}",
+                result.message
+            );
+        }
     }
 
     #[tokio::test]
@@ -8410,6 +9113,8 @@ printf '%s %s\n' "${0##*/}" "$*" >> "$CUL_POINTER_TEST_LOG"
         let result = run_wtype_type_text_or_fallback(
             Path::new("/definitely/missing/wtype"),
             "text",
+            WtypeTextMode::Argument,
+            false,
             || async {
                 TokioCommand::new("sh")
                     .args(["-c", "exit 0"])
@@ -8422,6 +9127,20 @@ printf '%s %s\n' "${0##*/}" "$*" >> "$CUL_POINTER_TEST_LOG"
         .expect("missing wtype should use fallback");
 
         assert_eq!(result.backend, KeyboardCommandBackend::Ydotool);
+    }
+
+    #[test]
+    fn wtype_text_validation_counts_bytes_and_rejects_nul() {
+        assert!(validate_wtype_text(&"x".repeat(WTYPE_MAX_TEXT_BYTES)).is_ok());
+        assert!(validate_wtype_text(&"x".repeat(WTYPE_MAX_TEXT_BYTES + 1))
+            .unwrap_err()
+            .contains("not sent"));
+        // The argument limit counts UTF-8 bytes, not Unicode scalar values.
+        assert!(validate_wtype_text(&"ş".repeat(WTYPE_MAX_TEXT_BYTES / 2 + 1)).is_err());
+        assert!(validate_wtype_text("valid prefix\0suffix")
+            .unwrap_err()
+            .contains("not sent"));
+        assert!(validate_wtype_text("").is_ok());
     }
 
     #[tokio::test]
@@ -8438,13 +9157,19 @@ printf '%s %s\n' "${0##*/}" "$*" >> "$CUL_POINTER_TEST_LOG"
         std::fs::set_permissions(&wtype, std::fs::Permissions::from_mode(0o700))
             .expect("make fake wtype executable");
 
-        let result = run_wtype_type_text_or_fallback(&wtype, "text", || async {
-            std::fs::write(&fallback_marker, "ran").unwrap();
-            TokioCommand::new("true")
-                .output()
-                .await
-                .map_err(|error| error.to_string())
-        })
+        let result = run_wtype_type_text_or_fallback(
+            &wtype,
+            "text",
+            WtypeTextMode::Argument,
+            false,
+            || async {
+                std::fs::write(&fallback_marker, "ran").unwrap();
+                TokioCommand::new("true")
+                    .output()
+                    .await
+                    .map_err(|error| error.to_string())
+            },
+        )
         .await;
 
         assert!(result.is_err());
@@ -9102,20 +9827,39 @@ mod focus_probe_feedback_tests {
 
     #[test]
     fn only_a_complete_empty_search_warns() {
-        let none = focus_probe_feedback(&FocusProbe::NoneFocused, true);
+        let none = focus_probe_feedback(&FocusProbe::NoneFocused, true, false);
         assert!(none.starts_with("WARNING:"), "{none}");
 
         for probe in [FocusProbe::Incomplete, FocusProbe::NoAccessibleApp] {
-            let text = focus_probe_feedback(&probe, true);
+            let text = focus_probe_feedback(&probe, true, false);
             assert!(
                 !text.contains("WARNING"),
                 "{probe:?} must not claim lost input: {text}"
             );
             assert!(text.contains("could not be verified"), "{text}");
         }
-        assert!(focus_probe_feedback(&FocusProbe::Incomplete, true).contains("search limits"));
-        assert!(focus_probe_feedback(&FocusProbe::NoAccessibleApp, true)
-            .contains("--force-renderer-accessibility"));
+        assert!(
+            focus_probe_feedback(&FocusProbe::Incomplete, true, false).contains("search limits")
+        );
+        assert!(
+            focus_probe_feedback(&FocusProbe::NoAccessibleApp, true, false)
+                .contains("--force-renderer-accessibility")
+        );
+    }
+
+    #[test]
+    fn review_exact_focus_only_softens_shell_only_tree() {
+        for expects_editable in [false, true] {
+            let text = focus_probe_feedback(&FocusProbe::NoneFocused, expects_editable, true);
+            assert!(text.starts_with("WARNING:"), "{text}");
+            let text = focus_probe_feedback(&FocusProbe::ShellOnly, expects_editable, false);
+            assert!(text.starts_with("WARNING:"), "{text}");
+            let text = focus_probe_feedback(&FocusProbe::ShellOnly, expects_editable, true);
+            assert!(!text.contains("WARNING"), "{text}");
+            assert!(!text.contains("landed nowhere"), "{text}");
+            assert!(text.contains("before input"), "{text}");
+            assert!(text.contains("Field contents were not verified"), "{text}");
+        }
     }
 
     #[test]
@@ -9127,7 +9871,7 @@ mod focus_probe_feedback_tests {
             states: vec!["focused".to_string()],
             is_terminal: false,
         };
-        let text = focus_probe_feedback(&FocusProbe::Found(element), true);
+        let text = focus_probe_feedback(&FocusProbe::Found(element), true, false);
         assert!(text.contains("text"), "{text}");
         assert!(!text.starts_with("WARNING"), "{text}");
     }
