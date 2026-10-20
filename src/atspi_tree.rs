@@ -3,6 +3,7 @@ use anyhow::{anyhow, Context, Result};
 use atspi::{
     proxy::{
         accessible::{AccessibleProxy, ObjectRefExt},
+        action::ActionProxy,
         proxy_ext::ProxyExt,
     },
     CoordType, ObjectRef, ObjectRefOwned, StateSet,
@@ -18,7 +19,7 @@ use tokio::time::timeout;
 use zbus::{
     fdo::DBusProxy,
     names::{BusName, UniqueName},
-    zvariant::ObjectPath,
+    zvariant::{ObjectPath, OwnedObjectPath},
 };
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -110,6 +111,8 @@ const DEFAULT_SNAPSHOT_MAX_DEPTH: u32 = 32;
 const HARD_SNAPSHOT_MAX_DEPTH: u32 = 64;
 const CHILD_READ_CONCURRENCY: usize = 16;
 const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_ACTIONS_PER_OBJECT: i32 = 64;
+const ACTION_QUERY_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_DISCOVERY_ROOTS: usize = 256;
 const ROOT_MATCH_CHILD_LIMIT: usize = 8;
 const MAX_DISCOVERY_CHILD_READS: usize = MAX_DISCOVERY_ROOTS * ROOT_MATCH_CHILD_LIMIT;
@@ -248,10 +251,30 @@ async fn children_up_to(
     let child_count = proxy.child_count().await?;
     Ok(
         fetch_indexed_up_to(child_count, limit, remaining_attempts, |index| {
-            proxy.get_child_at_index(index)
+            child_at_index(proxy, index)
         })
         .await,
     )
+}
+
+async fn child_at_index(proxy: &AccessibleProxy<'_>, index: i32) -> zbus::Result<ObjectRefOwned> {
+    // WebKit sockets return a well-known bus name. atspi's ObjectRef decoder
+    // only accepts unique names, so resolve the wire reference before using it.
+    let (name, path): (String, OwnedObjectPath) =
+        proxy.inner().call("GetChildAtIndex", &(index,)).await?;
+    if path.as_str() == "/org/a11y/atspi/null" {
+        return Ok(ObjectRef::Null.into());
+    }
+    match BusName::try_from(name)? {
+        BusName::Unique(name) => Ok(ObjectRef::new_owned(name, path)),
+        name => {
+            let owner = DBusProxy::new(proxy.inner().connection())
+                .await?
+                .get_name_owner(name)
+                .await?;
+            Ok(ObjectRef::new_owned(owner, path))
+        }
+    }
 }
 
 pub async fn list_accessible_apps(limit: usize) -> Result<Vec<AccessibleAppSummary>> {
@@ -579,26 +602,32 @@ async fn perform_action_inner(
     requested_action: Option<&str>,
     name_only: bool,
 ) -> Result<ActionInvocation> {
-    let conn = connect().await?;
     let object_ref = object_ref_from_id(object_ref_id)?;
-    let proxy = open_accessible(&conn, &object_ref)
-        .await
-        .with_context(|| format!("failed to open AT-SPI object {object_ref_id}"))?;
-    let action = proxy
-        .proxies()
-        .await?
-        .action()
-        .await
-        .context("element does not expose the AT-SPI Action interface")?;
-    let actions = action.get_actions().await.unwrap_or_default();
-    let action_index = if name_only {
-        select_named_action_index(&actions, requested_action.unwrap_or_default())?
-    } else {
-        select_action_index(&actions, requested_action)?
-    };
-    let action_name = actions
-        .get(action_index as usize)
-        .map(|action| action.name.clone());
+    let (action, action_index, action_name) = timeout(ACTION_QUERY_TIMEOUT, async {
+        let conn = connect().await?;
+        let proxy = open_accessible(&conn, &object_ref)
+            .await
+            .with_context(|| format!("failed to open AT-SPI object {object_ref_id}"))?;
+        let action = proxy
+            .proxies()
+            .await?
+            .action()
+            .await
+            .context("element does not expose the AT-SPI Action interface")?;
+        let actions = read_actions(&action).await?;
+        let action_index = if name_only {
+            select_named_action_index(&actions, requested_action.unwrap_or_default())?
+        } else {
+            select_action_index(&actions, requested_action)?
+        };
+        let action_name = actions
+            .get(action_index as usize)
+            .map(|action| action.name.clone());
+        Ok::<_, anyhow::Error>((action, action_index, action_name))
+    })
+    .await
+    .context("AT-SPI action revalidation exceeded its 5-second deadline")??;
+    // Only time out the reads: once DoAction is sent, it may already have acted.
     let ok = action
         .do_action(action_index)
         .await
@@ -951,8 +980,7 @@ async fn actions_from_proxies(
         return Vec::new();
     };
 
-    action_proxy
-        .get_actions()
+    read_actions(&action_proxy)
         .await
         .unwrap_or_default()
         .into_iter()
@@ -964,6 +992,45 @@ async fn actions_from_proxies(
             keybinding: action.keybinding,
         })
         .collect()
+}
+
+async fn read_actions(proxy: &ActionProxy<'_>) -> Result<Vec<atspi::Action>> {
+    // WebKit can advertise GetActions without replying to it. The indexed
+    // methods work, and must also be used when revalidating a cached action.
+    // Keep the wire spelling: the current atspi binding asks for "Nactions".
+    timeout(ACTION_QUERY_TIMEOUT, async {
+        let count = proxy
+            .inner()
+            .get_property::<i32>("NActions")
+            .await
+            .context("failed to read AT-SPI action count")?;
+        if count > MAX_ACTIONS_PER_OBJECT {
+            return Err(anyhow!(
+                "AT-SPI action count {count} exceeds the {MAX_ACTIONS_PER_OBJECT}-action read budget"
+            ));
+        }
+        if count < 0 {
+            return Err(anyhow!("invalid negative AT-SPI action count {count}"));
+        }
+        Ok(stream::iter(0..count)
+            .map(|index| async move {
+                let (name, description, keybinding) = tokio::join!(
+                    proxy.get_localized_name(index),
+                    proxy.get_description(index),
+                    proxy.get_key_binding(index),
+                );
+                atspi::Action {
+                    name: name.unwrap_or_default(),
+                    description: description.unwrap_or_default(),
+                    keybinding: keybinding.unwrap_or_default(),
+                }
+            })
+            .buffered(CHILD_READ_CONCURRENCY)
+            .collect()
+            .await)
+    })
+    .await
+    .context("AT-SPI action reads exceeded their 5-second deadline")?
 }
 
 async fn states_from_proxy(proxy: &AccessibleProxy<'_>) -> Vec<String> {
@@ -1121,6 +1188,334 @@ fn object_ref_id(object_ref: &ObjectRefOwned) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{
+        io::{BufRead, BufReader},
+        process::{Child, Command, Stdio},
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        },
+    };
+
+    struct PrivateBus(Child);
+
+    impl PrivateBus {
+        fn start() -> (Self, String) {
+            let mut bus = Self(
+                Command::new("dbus-daemon")
+                    .args(["--session", "--nofork", "--nopidfile", "--print-address=1"])
+                    .stdout(Stdio::piped())
+                    .spawn()
+                    .unwrap(),
+            );
+            let mut address = String::new();
+            BufReader::new(bus.0.stdout.take().unwrap())
+                .read_line(&mut address)
+                .unwrap();
+            (bus, address.trim().to_string())
+        }
+    }
+
+    impl Drop for PrivateBus {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    struct FakeAccessible {
+        name: String,
+        children: Vec<(String, OwnedObjectPath)>,
+        has_action: bool,
+    }
+
+    #[zbus::interface(name = "org.a11y.atspi.Accessible")]
+    impl FakeAccessible {
+        #[zbus(property)]
+        fn child_count(&self) -> i32 {
+            self.children.len() as i32
+        }
+
+        #[zbus(property)]
+        fn name(&self) -> &str {
+            &self.name
+        }
+
+        fn get_interfaces(&self) -> Vec<&str> {
+            let mut interfaces = vec!["org.a11y.atspi.Accessible"];
+            if self.has_action {
+                interfaces.push("org.a11y.atspi.Action");
+            }
+            interfaces
+        }
+
+        fn get_child_at_index(
+            &self,
+            index: i32,
+        ) -> zbus::fdo::Result<((String, OwnedObjectPath),)> {
+            self.children
+                .get(index as usize)
+                .cloned()
+                .map(|child| (child,))
+                .ok_or_else(|| zbus::fdo::Error::InvalidArgs("invalid child index".into()))
+        }
+    }
+
+    struct FakeWebKitAction {
+        count: i32,
+        stall_indexed_reads: bool,
+        name_reads: Arc<AtomicUsize>,
+    }
+
+    impl Default for FakeWebKitAction {
+        fn default() -> Self {
+            Self {
+                count: 1,
+                stall_indexed_reads: false,
+                name_reads: Arc::default(),
+            }
+        }
+    }
+
+    #[zbus::interface(name = "org.a11y.atspi.Action")]
+    impl FakeWebKitAction {
+        async fn get_actions(&self) -> Vec<atspi::Action> {
+            std::future::pending().await
+        }
+
+        #[zbus(property, name = "NActions")]
+        fn nactions(&self) -> i32 {
+            self.count
+        }
+
+        fn get_name(&self, index: i32) -> &str {
+            assert!((0..self.count).contains(&index));
+            "click"
+        }
+
+        async fn get_localized_name(&self, index: i32) -> &str {
+            assert!((0..self.count).contains(&index));
+            self.name_reads.fetch_add(1, Ordering::SeqCst);
+            if self.stall_indexed_reads {
+                std::future::pending::<()>().await;
+            }
+            "Activate"
+        }
+
+        fn get_description(&self, index: i32) -> &str {
+            assert!((0..self.count).contains(&index));
+            "Activate the control"
+        }
+
+        fn get_key_binding(&self, index: i32) -> &str {
+            assert!((0..self.count).contains(&index));
+            "Return"
+        }
+
+        fn do_action(&self, index: i32) -> bool {
+            index == 0
+        }
+    }
+
+    #[tokio::test]
+    async fn indexed_children_resolve_webkit_names_on_the_accessibility_bus() {
+        let (_bus, address) = PrivateBus::start();
+
+        let webkit_name = "org.webkit.MockWebProcess";
+        let child_path = "/org/a11y/webkit/accessible/child";
+        let webkit = zbus::connection::Builder::address(address.trim())
+            .unwrap()
+            .name(webkit_name)
+            .unwrap()
+            .serve_at(
+                child_path,
+                FakeAccessible {
+                    name: "WebKit page".into(),
+                    children: Vec::new(),
+                    has_action: true,
+                },
+            )
+            .unwrap()
+            .serve_at(child_path, FakeWebKitAction::default())
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        let owner = webkit.unique_name().unwrap().to_string();
+        let gtk = zbus::connection::Builder::address(address.trim())
+            .unwrap()
+            .serve_at(
+                "/org/a11y/atspi/accessible/root",
+                FakeAccessible {
+                    name: "GTK socket".into(),
+                    has_action: false,
+                    children: vec![
+                        (webkit_name.into(), child_path.try_into().unwrap()),
+                        (owner.clone(), child_path.try_into().unwrap()),
+                        (String::new(), "/org/a11y/atspi/null".try_into().unwrap()),
+                        (
+                            "org.webkit.UnownedWebProcess".into(),
+                            child_path.try_into().unwrap(),
+                        ),
+                    ],
+                },
+            )
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        let client = zbus::connection::Builder::address(address.trim())
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        let proxy = AccessibleProxy::builder(&client)
+            .destination(gtk.unique_name().unwrap().clone())
+            .unwrap()
+            .path("/org/a11y/atspi/accessible/root")
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        let mut remaining = 4;
+        let reply = proxy
+            .inner()
+            .call_method("GetChildAtIndex", &(0_i32,))
+            .await
+            .unwrap();
+        assert_eq!(reply.body().signature().to_string(), "(so)");
+        let batch = children_up_to(&proxy, 4, &mut remaining).await.unwrap();
+
+        assert_eq!(batch.attempted, 4);
+        assert_eq!(remaining, 0);
+        assert!(!batch.incomplete);
+        assert_eq!(batch.items.len(), 3, "only the unowned name should fail");
+        assert_eq!(batch.items[0].name_as_str(), Some(owner.as_str()));
+        assert_eq!(batch.items[0].path_as_str(), child_path);
+        assert_eq!(batch.items[0], batch.items[1]);
+        assert!(batch.items[2].is_null());
+
+        // The canonical reference remains usable by the normal read/action path.
+        let child = batch.items[0].as_accessible_proxy(&client).await.unwrap();
+        assert_eq!(child.name().await.unwrap(), "WebKit page");
+        assert_eq!(
+            object_ref_from_id(&object_ref_id(&batch.items[0])).unwrap(),
+            batch.items[0]
+        );
+        let action = child.proxies().await.unwrap().action().await.unwrap();
+        let actions = timeout(Duration::from_secs(1), read_actions(&action))
+            .await
+            .expect("indexed action reads must not wait for GetActions")
+            .unwrap();
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].name, "Activate");
+        assert_eq!(actions[0].description, "Activate the control");
+        assert_eq!(actions[0].keybinding, "Return");
+        assert_eq!(select_named_action_index(&actions, "Activate").unwrap(), 0);
+        assert!(action.do_action(0).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn indexed_actions_bound_untrusted_counts_before_reading_indices() {
+        let (_bus, address) = PrivateBus::start();
+        let name_reads = Arc::new(AtomicUsize::new(0));
+        let counts = [
+            -1,
+            MAX_ACTIONS_PER_OBJECT + 1,
+            i32::MAX,
+            0,
+            MAX_ACTIONS_PER_OBJECT,
+        ];
+        let mut builder = zbus::connection::Builder::address(address.as_str()).unwrap();
+        for (index, count) in counts.iter().enumerate() {
+            builder = builder
+                .serve_at(
+                    format!("/actions/{index}"),
+                    FakeWebKitAction {
+                        count: *count,
+                        name_reads: Arc::clone(&name_reads),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+        }
+        let peer = builder.build().await.unwrap();
+        let client = zbus::connection::Builder::address(address.as_str())
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+
+        for (index, count) in counts.iter().enumerate() {
+            let action = ActionProxy::builder(&client)
+                .destination(peer.unique_name().unwrap().clone())
+                .unwrap()
+                .path(format!("/actions/{index}"))
+                .unwrap()
+                .cache_properties(zbus::proxy::CacheProperties::No)
+                .build()
+                .await
+                .unwrap();
+            let result = timeout(Duration::from_secs(1), read_actions(&action))
+                .await
+                .expect("untrusted counts must not cause unbounded work");
+            if (0..=MAX_ACTIONS_PER_OBJECT).contains(count) {
+                assert_eq!(result.unwrap().len(), *count as usize);
+            } else {
+                let error = result.unwrap_err().to_string();
+                assert!(error.contains("action count"), "{error}");
+                assert_eq!(name_reads.load(Ordering::SeqCst), 0);
+            }
+        }
+        assert_eq!(
+            name_reads.load(Ordering::SeqCst),
+            MAX_ACTIONS_PER_OBJECT as usize
+        );
+    }
+
+    #[tokio::test]
+    async fn indexed_actions_time_out_the_entire_read() {
+        let (_bus, address) = PrivateBus::start();
+        let name_reads = Arc::new(AtomicUsize::new(0));
+        let peer = zbus::connection::Builder::address(address.as_str())
+            .unwrap()
+            .serve_at(
+                "/actions/stalled",
+                FakeWebKitAction {
+                    stall_indexed_reads: true,
+                    name_reads: Arc::clone(&name_reads),
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        let client = zbus::connection::Builder::address(address.as_str())
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        let action = ActionProxy::builder(&client)
+            .destination(peer.unique_name().unwrap().clone())
+            .unwrap()
+            .path("/actions/stalled")
+            .unwrap()
+            .cache_properties(zbus::proxy::CacheProperties::No)
+            .build()
+            .await
+            .unwrap();
+
+        let error = timeout(
+            ACTION_QUERY_TIMEOUT + Duration::from_secs(1),
+            read_actions(&action),
+        )
+        .await
+        .expect("indexed reads must have an overall deadline")
+        .unwrap_err();
+        assert!(error.to_string().contains("5-second deadline"));
+        assert_eq!(name_reads.load(Ordering::SeqCst), 1);
+    }
 
     #[test]
     fn split_object_ref_id_separates_bus_name_and_path() {
